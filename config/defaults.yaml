@@ -3,13 +3,13 @@
 # the defaults can be found in src/utils/constants.py
 
 # The method name must be identical to the file name in src/server/<method>.py
-method: sfl
+method: fedcp
 
 dataset:
   # [mnist, cifar10, cifar100, emnist, fmnist, femnist, medmnist,
   # medmnistA, medmnistC, covid19, celeba, synthetic, svhn,
   # tiny_imagenet, cinic10, domain]
-  name: cifar10
+  name: mnist
 
 model:
   name: avgcnn
@@ -54,7 +54,7 @@ optimizer:
   betas: [0.9, 0.999] # for [Adam, AdamW]
   amsgrad: false # for [Adam, AdamW]
 
-mode: serial # [serial, parallel, sequential]
+mode: serial # [serial, parallel]
 # It's fine to keep these configs. if mode is 'serial', these configs will be ignored.
 parallel:
   # The IP address of the selected ray cluster.
