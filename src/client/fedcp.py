@@ -1,13 +1,12 @@
 import copy
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from typing import Any
+from collections import OrderedDict
 
 from src.client.fedavg import FedAvgClient
 
 
-def MMD(x, y, kernel="rbf", device='cpu'):
+def MMD(x, y, kernel="rbf", device='gpu'):
     xx, yy, zz = torch.mm(x, x.t()), torch.mm(y, y.t()), torch.mm(x, y.t())
     rx = (xx.diag().unsqueeze(0).expand_as(xx))
     ry = (yy.diag().unsqueeze(0).expand_as(yy))
@@ -36,115 +35,22 @@ def MMD(x, y, kernel="rbf", device='cpu'):
     return torch.mean(XX + YY - 2. * XY)
 
 
-class Gate(nn.Module):
-    def __init__(self, cs: nn.Module):
-        super().__init__()
-        self.cs = cs
-        self.pm = []
-        self.gm = []
-        self.pm_ = []
-        self.gm_ = []
-
-    def forward(self, rep, tau=1.0, hard=False, context=None, flag=0):
-        pm, gm = self.cs(context, tau=tau, hard=hard)
-        if self.training:
-            self.pm.extend(pm)
-            self.gm.extend(gm)
-        else:
-            self.pm_.extend(pm)
-            self.gm_.extend(gm)
-
-        if flag == 0:
-            rep_p = rep * pm
-            rep_g = rep * gm
-            return rep_p, rep_g
-        elif flag == 1:
-            return rep * pm
-        else:
-            return rep * gm
-
-
-class ConditionalSelection(nn.Module):
-    def __init__(self, in_dim, h_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(in_dim, h_dim * 2),
-            nn.LayerNorm([h_dim * 2]),
-            nn.ReLU(),
-        )
-
-    def forward(self, x, tau=1.0, hard=False):
-        shape_ = x.shape
-        out = self.fc(x)
-        out = out.view(shape_[0], 2, -1)
-        out = F.gumbel_softmax(out, dim=1, tau=tau, hard=hard)
-        return out[:, 0, :], out[:, 1, :]
-
-
-class Ensemble(nn.Module):
-    def __init__(self, model: nn.Module, cs: nn.Module):
-        super().__init__()
-        self.base = model.base                              # local 模型
-        self.classifier = model.classifier                  # local 模型
-        self.model = copy.deepcopy(model)                   # global fixed
-
-        for param in self.model.base.parameters():
-            param.requires_grad = False
-        for param in self.model.classifier.parameters():
-            param.requires_grad = False
-
-        self.flag = 0
-        self.tau = 1
-        self.hard = False
-        self.context = None
-
-        self.gate = Gate(cs)
-
-    def forward(self, x, is_rep=False, context=None):
-        rep_local = self.base(x)
-
-        gate_in = rep_local
-        if context is not None:
-            context = F.normalize(context, p=2, dim=1)
-            batch_size = x[0].shape[0] if isinstance(x, list) else x.shape[0]
-            self.context = torch.tile(context, (batch_size, 1))
-            gate_in = rep_local * self.context
-
-        if self.flag == 0:  # ghead + phead
-            rep_p, rep_g = self.gate(rep_local, self.tau, self.hard, gate_in, flag=0)
-            out_local = self.classifier(rep_p)
-            out_global = self.model.classifier(rep_g)
-            output = out_local + out_global
-        elif self.flag == 1:  # phead
-            rep_p = self.gate(rep_local, self.tau, self.hard, gate_in, flag=1)
-            output = self.classifier(rep_p)
-        else:  # ghead
-            rep_g = self.gate(rep_local, self.tau, self.hard, gate_in, flag=2)
-            output = self.model.classifier(rep_g)
-
-        if is_rep:
-            rep_base = self.model.base(x)
-            return output, rep_local, rep_base
-        else:
-            return output
-
-
 class FedCPClient(FedAvgClient):
     def __init__(self, **commons):
         super().__init__(**commons)
         # lamda 系数 (MMD 强度)
         self.lamda = getattr(self.args, "lamda", 0.0)
-
-        in_dim = list(self.model.classifier.parameters())[0].shape[1]
-        cs = ConditionalSelection(in_dim=in_dim, h_dim=in_dim).to(self.device)
-        self.model = Ensemble(model=self.model, cs=cs).to(self.device)
+        self.regular_params_name = list(key for key, _ in self.model.named_parameters())
 
     def set_parameters(self, package: dict[str, Any]):
+        # def set_parameters(self, feature_extractor) 复现
         super().set_parameters(package)
+        self.model.model.base = copy.deepcopy(self.model.base)
 
+        # def set_head_g(self, head) 复现
         with torch.no_grad():
             headw_ps = []
-            for name, mat in self.model.model.classifier.named_parameters():
+            for name, mat in self.model.classifier.named_parameters():
                 if 'weight' in name:
                     headw_ps.append(mat.data)
             if len(headw_ps) > 0:
@@ -154,7 +60,24 @@ class FedCPClient(FedAvgClient):
                 headw_p.detach_()
                 self.context = torch.sum(headw_p, dim=0, keepdim=True).to(self.device)
 
+            model_param = package['regular_model_params']
+
+            # Helper function to update parameters
+            def update_module_params(module, keyword):
+                filtered_params = OrderedDict()
+                for key in model_param.keys():
+                    if keyword in key:
+                        filtered_params[key] = model_param[key]
+
+                for new_param, old_param in zip(filtered_params.values(), module.parameters()):
+                    old_param.data = new_param.data.clone()
+
+            # Update classifier and gate parameters using the helper function
+            update_module_params(self.model.model.classifier, 'classifier')
+            update_module_params(self.model.gate.cs, 'gate')
+
     def fit(self):
+        # client.train_cs_model() 复现
         self.model.train()
         self.dataset.train()
         for _ in range(self.local_epoch):
@@ -163,8 +86,6 @@ class FedCPClient(FedAvgClient):
             self.model.gate.gm = []
 
             for x, y in self.trainloader:
-                if len(x) <= 1:
-                    continue
                 if isinstance(x, list):
                     x[0] = x[0].to(self.device)
                 else:
@@ -182,6 +103,11 @@ class FedCPClient(FedAvgClient):
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
+
+        # client.generate_upload_head() 复现
+        for (np, pp), (ng, pg) in zip(self.model.classifier.named_parameters(),
+                                      self.model.model.classifier.named_parameters()):
+            pg.data = pp * 0.5 + pg * 0.5
 
     def finetune(self):
         self.model.train()
